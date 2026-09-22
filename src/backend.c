@@ -24,6 +24,13 @@ static gchar *find_searchd(void)
     }
     g_free(dev);
 
+    gchar *beside = g_build_filename(bindir, "hawk-searchd", NULL);
+    if (g_file_test(beside, G_FILE_TEST_IS_EXECUTABLE)) {
+        g_free(bindir);
+        return beside;
+    }
+    g_free(beside);
+
     gchar *cwd = g_build_filename(g_get_current_dir(), "scripts", "hawk-searchd", NULL);
     if (g_file_test(cwd, G_FILE_TEST_IS_EXECUTABLE)) {
         g_free(bindir);
@@ -90,7 +97,22 @@ void hawk_backend_start(HawkWin *self)
 
 void hawk_backend_stop(void)
 {
-    gchar *base = g_build_filename(g_get_user_data_dir(), "hawk", NULL);
+    gchar *path = find_searchd();
+    if (path) {
+        gchar *argv[] = { path, "stop", NULL };
+        GError *err = NULL;
+        GPid pid;
+        if (g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+                          NULL, NULL, &pid, &err)) {
+            g_child_watch_add(pid, (GChildWatchFunc)g_spawn_close_pid, NULL);
+        } else {
+            g_clear_error(&err);
+        }
+        g_free(path);
+        return;
+    }
+
+    gchar *base = hawk_data_subdir(HAWK_SEARCHD_SUBDIR);
     gchar *pidfile = g_build_filename(base, HAWK_PIDFILE, NULL);
 
     gchar *contents = NULL;

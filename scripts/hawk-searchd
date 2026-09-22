@@ -16,7 +16,7 @@
 
 set -u
 
-BASE="${XDG_DATA_HOME:-$HOME/.local/share}/hawk"
+BASE="${HOME:-$HOME}/.hawk/searchd"
 SRC="$BASE/src"
 VENV="$BASE/venv"
 PIDFILE="$BASE/searchd.pid"
@@ -86,6 +86,17 @@ YAML
 ensure_setup() {
     mkdir -p "$BASE"
 
+    OLD_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/hawk"
+    if [ ! -d "$SRC" ] && [ -d "$OLD_BASE/src" ]; then
+        echo "Hawk: moving existing search engine into ~/.hawk/searchd..." >&2
+        for d in src venv; do
+            [ -d "$OLD_BASE/$d" ] && mv "$OLD_BASE/$d" "$BASE/"
+        done
+        for f in settings.yml secret_key .ready; do
+            [ -f "$OLD_BASE/$f" ] && mv "$OLD_BASE/$f" "$BASE/"
+        done
+    fi
+
     if [ ! -d "$SRC" ]; then
         echo "Hawk: cloning SearXNG source (first run only)..." >&2
         if ! git clone --depth 1 https://github.com/searxng/searxng.git "$SRC" 2>> "$LOGFILE"; then
@@ -130,10 +141,10 @@ start() {
         exit 1
     fi
     : > "$LOGFILE"   # fresh log each launch
-    ( cd "$SRC" && \
-      SEARXNG_SETTINGS_PATH="$BASE/settings.yml" \
-      nohup "$VENV/bin/python" -m searx.webapp >> "$LOGFILE" 2>&1 < /dev/null &
-      echo $! > "$PIDFILE" )
+    cd "$SRC" || exit 1
+    SEARXNG_SETTINGS_PATH="$BASE/settings.yml" \
+        nohup "$VENV/bin/python" -m searx.webapp >> "$LOGFILE" 2>&1 < /dev/null &
+    echo $! > "$PIDFILE"
     i=0
     while [ "$i" -lt 90 ]; do    # SearXNG cold-boots in ~25 s; give it 45 s
         if is_up; then
@@ -150,15 +161,21 @@ start() {
 stop() {
     if [ -f "$PIDFILE" ]; then
         PID="$(cat "$PIDFILE" 2>/dev/null || true)"
-        if [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null; then
-            echo "Hawk search backend stopped"
-        else
-            echo "Hawk: no running backend (pid $PID)"
+        if [ -n "${PID:-}" ]; then
+            kill "$PID" 2>/dev/null || true
+            i=0
+            while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 20 ]; do
+                sleep 0.2
+                i=$((i + 1))
+            done
+            kill -9 "$PID" 2>/dev/null || true
         fi
         rm -f "$PIDFILE"
-    else
-        echo "Hawk: no pidfile — nothing to stop"
     fi
+    for P in $(pgrep -f 'searx\.webapp' 2>/dev/null || true); do
+        kill "$P" 2>/dev/null || true
+    done
+    echo "Hawk search backend stopped"
 }
 
 status() {

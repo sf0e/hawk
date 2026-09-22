@@ -1,5 +1,5 @@
 #!/bin/sh
-# Hawk — install script
+# Hawk — "a browser that stays out of your way." install script
 # You just ran a curl straight into your shell. Please understand the risks
 # and maybe read this before doing that. There is nothing here that will eat
 # your files, but there is a browser that occasionally closes itself.
@@ -9,8 +9,11 @@
 #   2. installs build dependencies with your package manager
 #   3. clones the Hawk source from GitHub
 #   4. builds it
-#   5. drops the binary at ~/.local/bin/hawk
+#   5. drops the binary + search manager at ~/.local/bin/
 #   6. installs a desktop entry + icons so it shows up in rofi / app menus
+#   7. all browser data (cookies, history, sessions) lives in ~/.hawk
+#
+# uninstall: curl -fsSL https://sf0e.github.io/hawk/get/uninstall.sh | sh
 set -e
 
 REPO="sf0e/hawk"
@@ -78,6 +81,7 @@ ninja -C build
 
 mkdir -p "$BINDIR"
 install -m755 build/hawk "$BINDIR/hawk"
+install -m755 scripts/hawk-searchd "$BINDIR/hawk-searchd"
 
 say "installing menu entry and icons..."
 APPS="$HOME/.local/share/applications"

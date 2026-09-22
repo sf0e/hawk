@@ -3,7 +3,7 @@
 #include <gdk/gdkkeysyms.h>
 #include <string.h>
 
-#define HAWK_UA "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15 Hawk/0.1.0"
+#define HAWK_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
 
 static void apply_css(HawkWin *self);
 static void apply_view_privacy(WebKitWebView *view, const SearchConfig *cfg);
@@ -28,6 +28,10 @@ static void refresh_tab_label(HawkTab *tab);
 static void tab_update_uri(HawkTab *tab, const gchar *uri);
 static void tab_update_title(HawkTab *tab, const gchar *title);
 static const gchar *default_home(HawkWin *win);
+static void history_append(HawkWin *win, const gchar *url);
+static void history_save(HawkWin *win);
+static void on_hawk_scheme(WebKitURISchemeRequest *request, gpointer user_data);
+static void register_hawk_scheme(HawkWin *win);
 
 static GtkWidget *icon_button(const gchar *icon_name)
 {
@@ -163,6 +167,7 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, HawkTab 
         const gchar *uri = webkit_web_view_get_uri(view);
         tab_update_uri(tab, uri);
         refresh_tab_label(tab);
+        history_append(win, uri);
         if (is_active) {
             gtk_editable_set_text(GTK_EDITABLE(win->entry), uri ? uri : "");
             gtk_window_set_title(GTK_WINDOW(win->win), uri ? uri : HAWK_NAME);
@@ -183,6 +188,134 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, HawkTab 
     default:
         break;
     }
+}
+
+static void history_append(HawkWin *win, const gchar *url)
+{
+    if (!url || !*url)
+        return;
+    if (!g_str_has_prefix(url, "http://") && !g_str_has_prefix(url, "https://"))
+        return;
+
+    GtkTreeModel *m = GTK_TREE_MODEL(win->hist);
+    GtkTreeIter it;
+    if (gtk_tree_model_get_iter_first(m, &it)) {
+        do {
+            gchar *s = NULL;
+            gtk_tree_model_get(m, &it, 0, &s, -1);
+            gboolean dup = s && g_str_equal(s, url);
+            g_free(s);
+            if (dup) {
+                gtk_list_store_remove(win->hist, &it);
+                break;
+            }
+        } while (gtk_tree_model_iter_next(m, &it));
+    }
+
+    GtkTreeIter first;
+    gtk_list_store_insert(win->hist, &first, 0);
+    gtk_list_store_set(win->hist, &first, 0, url, -1);
+
+    int n = gtk_tree_model_iter_n_children(m, NULL);
+    int cap = win->cfg.max_history > 0 ? win->cfg.max_history : 400;
+    while (n > cap) {
+        GtkTreeIter last;
+        if (!gtk_tree_model_iter_nth_child(m, &last, NULL, n - 1))
+            break;
+        gtk_list_store_remove(win->hist, &last);
+        n--;
+    }
+
+    history_save(win);
+}
+
+static void history_save(HawkWin *win)
+{
+    GString *buf = g_string_new(NULL);
+    GtkTreeModel *m = GTK_TREE_MODEL(win->hist);
+    GtkTreeIter it;
+    if (gtk_tree_model_get_iter_first(m, &it)) {
+        do {
+            gchar *s = NULL;
+            gtk_tree_model_get(m, &it, 0, &s, -1);
+            if (s) {
+                g_string_append(buf, s);
+                g_string_append_c(buf, '\n');
+                g_free(s);
+            }
+        } while (gtk_tree_model_iter_next(m, &it));
+    }
+    gchar *path = hawk_data_file("history");
+    g_file_set_contents(path, buf->str, buf->len, NULL);
+    g_free(path);
+    g_string_free(buf, TRUE);
+}
+
+static GtkListStore *history_load(void)
+{
+    GtkListStore *store = gtk_list_store_new(1, G_TYPE_STRING);
+    gchar *path = hawk_data_file("history");
+    gchar *contents = NULL;
+    if (g_file_get_contents(path, &contents, NULL, NULL) && contents) {
+        gchar **lines = g_strsplit(contents, "\n", -1);
+        for (gchar **p = lines; *p; p++) {
+            gchar *s = g_strstrip(*p);
+            if (*s) {
+                GtkTreeIter it;
+                gtk_list_store_append(store, &it);
+                gtk_list_store_set(store, &it, 0, s, -1);
+            }
+        }
+        g_strfreev(lines);
+    }
+    g_free(contents);
+    g_free(path);
+    return store;
+}
+
+void hawk_session_save(HawkWin *win)
+{
+    GString *buf = g_string_new(NULL);
+    for (guint i = 0; i < win->tabs->len; i++) {
+        HawkTab *t = g_ptr_array_index(win->tabs, i);
+        if (t->uri && *t->uri) {
+            g_string_append(buf, t->uri);
+            g_string_append_c(buf, '\n');
+        }
+    }
+    gchar *path = hawk_data_file("session");
+    g_file_set_contents(path, buf->str, buf->len, NULL);
+    g_free(path);
+    g_string_free(buf, TRUE);
+}
+
+static gchar **session_load(void)
+{
+    gchar *path = hawk_data_file("session");
+    gchar *contents = NULL;
+    if (!g_file_get_contents(path, &contents, NULL, NULL) || !contents) {
+        g_free(contents);
+        g_free(path);
+        return NULL;
+    }
+    g_free(path);
+
+    GPtrArray *urls = g_ptr_array_new();
+    gchar **lines = g_strsplit(contents, "\n", -1);
+    g_free(contents);
+    for (gchar **p = lines; *p; p++) {
+        gchar *s = g_strstrip(*p);
+        if (*s && (g_str_has_prefix(s, "http://") || g_str_has_prefix(s, "https://") ||
+                   g_str_has_prefix(s, "file://") || g_str_has_prefix(s, "about:")))
+            g_ptr_array_add(urls, g_strdup(s));
+    }
+    g_strfreev(lines);
+    if (urls->len == 0) {
+        g_ptr_array_free(urls, TRUE);
+        return NULL;
+    }
+    g_ptr_array_add(urls, NULL);
+    return (gchar **)g_ptr_array_free(urls, FALSE);
 }
 
 static WebKitWebView *on_create(WebKitWebView *view, WebKitNavigationAction *action, HawkTab *tab)
@@ -233,7 +366,8 @@ static void load_url_or_search(HawkWin *self, const gchar *raw)
     if (looks_like_url(trimmed)) {
         gchar *url = trimmed;
         if (!g_str_has_prefix(url, "http://") && !g_str_has_prefix(url, "https://") &&
-            !g_str_has_prefix(url, "file://") && !g_str_has_prefix(url, "about:")) {
+            !g_str_has_prefix(url, "file://") && !g_str_has_prefix(url, "about:") &&
+            !g_str_has_prefix(url, "hawk://")) {
             url = g_strconcat("https://", trimmed, NULL);
             g_free(trimmed);
         }
@@ -503,6 +637,7 @@ static void on_destroy(GtkWidget *win, HawkWin *self)
     (void)win;
     if (self->poll_id)
         g_source_remove(self->poll_id);
+    hawk_session_save(self);
     for (guint i = 0; i < self->tabs->len; i++) {
         HawkTab *t = g_ptr_array_index(self->tabs, i);
         g_free(t->title);
@@ -570,6 +705,14 @@ HawkWin *hawk_browser_new(GtkApplication *app)
     g_signal_connect_swapped(btn_settings, "clicked", G_CALLBACK(hawk_settings_open), self);
     g_signal_connect(self->entry, "activate", G_CALLBACK(on_entry_activate), self);
 
+    self->hist = history_load();
+    GtkEntryCompletion *comp = gtk_entry_completion_new();
+    gtk_entry_completion_set_model(comp, GTK_TREE_MODEL(self->hist));
+    gtk_entry_completion_set_text_column(comp, 0);
+    gtk_entry_completion_set_popup_single_match(comp, FALSE);
+    gtk_entry_completion_set_inline_completion(comp, FALSE);
+    gtk_entry_set_completion(GTK_ENTRY(self->entry), comp);
+
     
     GtkWidget *strip = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_add_css_class(strip, "tabstrip");
@@ -606,8 +749,20 @@ HawkWin *hawk_browser_new(GtkApplication *app)
 
     hawk_browser_apply_privacy(self);
 
-    
-    tab_new(self, default_home(self));
+    register_hawk_scheme(self);
+
+    if (self->cfg.restore_session) {
+        gchar **urls = session_load();
+        if (urls) {
+            for (gchar **p = urls; *p; p++)
+                tab_new(self, *p);
+            g_strfreev(urls);
+        } else {
+            tab_new(self, default_home(self));
+        }
+    } else {
+        tab_new(self, default_home(self));
+    }
 
     if (self->cfg.local_search && !self->backend_up) {
         
@@ -638,11 +793,14 @@ static void apply_view_privacy(WebKitWebView *view, const SearchConfig *cfg)
 {
     WebKitSettings *s = webkit_web_view_get_settings(view);
 
-    
     webkit_settings_set_user_agent(s, cfg->ua_lock ? HAWK_UA : NULL);
 
-    
     webkit_settings_set_enable_media_stream(s, !cfg->block_media);
+    webkit_settings_set_enable_mediasource(s, TRUE);
+    webkit_settings_set_enable_media_capabilities(s, TRUE);
+    webkit_settings_set_enable_media(s, TRUE);
+    webkit_settings_set_enable_webaudio(s, TRUE);
+    webkit_settings_set_enable_fullscreen(s, TRUE);
 }
 
 void hawk_browser_apply_privacy(HawkWin *self)
@@ -650,7 +808,6 @@ void hawk_browser_apply_privacy(HawkWin *self)
     for (guint i = 0; i < self->tabs->len; i++)
         apply_view_privacy(((HawkTab *)g_ptr_array_index(self->tabs, i))->view, &self->cfg);
 
-    
     WebKitNetworkSession *session = webkit_network_session_get_default();
     WebKitCookieManager *cookies = webkit_network_session_get_cookie_manager(session);
     webkit_cookie_manager_set_accept_policy(
@@ -658,5 +815,199 @@ void hawk_browser_apply_privacy(HawkWin *self)
         self->cfg.block_3p ? WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY
                            : WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
 
+    gchar *cookies_dir = hawk_data_subdir(HAWK_COOKIES_SUBDIR);
+    gchar *cookie_db = g_build_filename(cookies_dir, "cookies.sqlite", NULL);
+    webkit_cookie_manager_set_persistent_storage(
+        cookies, cookie_db, WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+    g_free(cookie_db);
+    g_free(cookies_dir);
+    webkit_network_session_set_persistent_credential_storage_enabled(session, TRUE);
+
     apply_color_scheme(self);
+}
+
+static gboolean cfg_bool(const gchar *v)
+{
+    return v && g_ascii_strcasecmp(v, "0") != 0 &&
+           g_ascii_strcasecmp(v, "false") != 0 &&
+           g_ascii_strcasecmp(v, "off") != 0;
+}
+
+static void html_toggle(GString *h, const gchar *key, const gchar *label, gboolean on)
+{
+    g_string_append_printf(h,
+        "<div class=\"row\"><span class=\"lbl\">%s</span>"
+        "<a class=\"tog %s\" href=\"hawk://config?%s=%d\">%s</a></div>\n",
+        label, on ? "on" : "off", key, on ? 0 : 1, on ? "on" : "off");
+}
+
+static gchar *config_html(HawkWin *self)
+{
+    GString *h = g_string_new(NULL);
+    gchar *data = hawk_data_dir();
+    gchar *cookies = hawk_data_subdir(HAWK_COOKIES_SUBDIR);
+    gchar *searchd = hawk_data_subdir(HAWK_SEARCHD_SUBDIR);
+
+    g_string_append(h,
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"color-scheme\" content=\"light dark\">"
+        "<title>hawk://config</title><style>"
+        "body{font-family:system-ui,sans-serif;max-width:620px;margin:24px auto;padding:0 12px;line-height:1.5}"
+        "h1{font-size:20px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:#888;margin-top:28px}"
+        ".row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #ddd}"
+        ".tog{text-decoration:none;font-weight:600;padding:2px 10px;border-radius:999px}"
+        ".tog.on{background:#1e8e3e;color:#fff} .tog.off{background:#888;color:#fff}"
+        "input[type=number],input[type=text]{padding:5px 8px;border:1px solid #aaa;border-radius:6px}"
+        "button{padding:6px 14px;border-radius:6px;border:1px solid #aaa;background:#eee;cursor:pointer}"
+        ".act a{display:block;margin:6px 0;color:#0b57d0}code{background:#eee;padding:1px 5px;border-radius:4px}"
+        ".mute{color:#777;font-size:13px} form{display:flex;gap:8px;align-items:center;padding:6px 0}"
+        "@media (prefers-color-scheme: dark){body{background:#1c1c1e;color:#e5e5e5}"
+        ".row{border-bottom-color:#333}.tog.off{background:#555}"
+        "input[type=number],input[type=text]{background:#2c2c2e;border-color:#444;color:#e5e5e5}"
+        "button{background:#333;color:#e5e5e5;border-color:#444}code{background:#333}"
+        ".act a{color:#7aa2ff}.mute{color:#999}}"
+        "</style></head><body>");
+
+    g_string_append_printf(h,
+        "<h1>Hawk &mdash; %s</h1>"
+        "<p class=\"mute\">hawk://config &middot; deeper settings, no second browser needed.</p>",
+        HAWK_MOTTO);
+
+    g_string_append(h, "<h2>search</h2>");
+    html_toggle(h, "local", "local search (SearXNG)", self->cfg.local_search);
+    g_string_append_printf(h,
+        "<form method=\"get\" action=\"hawk://config\"><label>home page "
+        "<input type=\"text\" name=\"home\" value=\"%s\"></label>"
+        "<button type=\"submit\">set</button></form>\n",
+        self->cfg.home ? self->cfg.home : "");
+
+    g_string_append(h, "<h2>privacy</h2>");
+    html_toggle(h, "block3p", "block third-party cookies", self->cfg.block_3p);
+    html_toggle(h, "ualock", "lock user agent", self->cfg.ua_lock);
+    html_toggle(h, "blockmedia", "block camera & microphone", self->cfg.block_media);
+    g_string_append_printf(h, "<p class=\"mute\">user agent: <code>%s</code></p>\n", HAWK_UA);
+
+    g_string_append(h, "<h2>session &amp; history</h2>");
+    html_toggle(h, "restore", "restore last session on start", self->cfg.restore_session);
+    g_string_append_printf(h,
+        "<form method=\"get\" action=\"hawk://config\"><label>history entries "
+        "<input type=\"number\" name=\"history\" min=\"10\" max=\"2000\" value=\"%d\"></label>"
+        "<button type=\"submit\">keep</button></form>\n",
+        self->cfg.max_history);
+    g_string_append_printf(h, "<p class=\"mute\">entries remembered: %d</p>\n",
+                           gtk_tree_model_iter_n_children(GTK_TREE_MODEL(self->hist), NULL));
+
+    g_string_append(h, "<h2>appearance</h2>");
+    html_toggle(h, "dark", "dark mode", self->cfg.dark);
+
+    g_string_append(h, "<h2>data</h2>");
+    g_string_append_printf(h,
+        "<p class=\"mute\">everything lives in one place:<br><code>%s</code></p>\n", data);
+    g_string_append_printf(h,
+        "<p class=\"mute\">cookies: <code>%s/cookies.sqlite</code><br>"
+        "history: <code>%s/history</code><br>session: <code>%s/session</code><br>"
+        "search backend: <code>%s</code></p>\n",
+        cookies, data, data, searchd);
+    g_string_append_printf(h, "<p class=\"mute\">search backend: %s</p>\n",
+                           hawk_backend_reachable() ? "running" : "not running");
+
+    g_string_append(h, "<h2>actions</h2><div class=\"act\">");
+    g_string_append(h,
+        "<a href=\"hawk://config?action=clear_history\">clear browsing history</a>"
+        "<a href=\"hawk://config?action=clear_cookies\">clear cookies &amp; site data</a>");
+    g_string_append(h, "</div>");
+
+    g_string_append(h, "</body></html>");
+
+    g_free(data);
+    g_free(cookies);
+    g_free(searchd);
+    return g_string_free(h, FALSE);
+}
+
+static void apply_config_query(HawkWin *self, const gchar *query)
+{
+    if (!query || !*query)
+        return;
+
+    GError *err = NULL;
+    GHashTable *params = g_uri_parse_params(query, -1, "&", G_URI_PARAMS_NONE, &err);
+    if (!params) {
+        g_clear_error(&err);
+        return;
+    }
+
+    const gchar *v;
+    if ((v = g_hash_table_lookup(params, "dark")))
+        self->cfg.dark = cfg_bool(v);
+    if ((v = g_hash_table_lookup(params, "local")))
+        self->cfg.local_search = cfg_bool(v);
+    if ((v = g_hash_table_lookup(params, "block3p")))
+        self->cfg.block_3p = cfg_bool(v);
+    if ((v = g_hash_table_lookup(params, "ualock")))
+        self->cfg.ua_lock = cfg_bool(v);
+    if ((v = g_hash_table_lookup(params, "blockmedia")))
+        self->cfg.block_media = cfg_bool(v);
+    if ((v = g_hash_table_lookup(params, "restore")))
+        self->cfg.restore_session = cfg_bool(v);
+    if ((v = g_hash_table_lookup(params, "history"))) {
+        long n = strtol(v, NULL, 10);
+        if (n >= 10 && n <= 2000)
+            self->cfg.max_history = (int)n;
+    }
+    if ((v = g_hash_table_lookup(params, "home")) && *v) {
+        g_free(self->cfg.home);
+        self->cfg.home = g_strdup(v);
+    }
+    if ((v = g_hash_table_lookup(params, "action"))) {
+        if (strcmp(v, "clear_history") == 0) {
+            GtkTreeIter it;
+            while (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(self->hist), &it))
+                gtk_list_store_remove(self->hist, &it);
+            history_save(self);
+        } else if (strcmp(v, "clear_cookies") == 0) {
+            WebKitNetworkSession *s = webkit_network_session_get_default();
+            WebKitWebsiteDataManager *wdm =
+                webkit_network_session_get_website_data_manager(s);
+            webkit_website_data_manager_clear(
+                wdm, WEBKIT_WEBSITE_DATA_ALL, 0, NULL, NULL, NULL);
+        }
+    }
+
+    g_hash_table_unref(params);
+    hawk_config_save(&self->cfg);
+    hawk_browser_apply_privacy(self);
+}
+
+static void on_hawk_scheme(WebKitURISchemeRequest *request, gpointer user_data)
+{
+    HawkWin *self = user_data;
+
+    if (g_strcmp0(webkit_uri_scheme_request_get_scheme(request), "hawk") != 0) {
+        GError *err = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                                          "unknown hawk:// resource");
+        webkit_uri_scheme_request_finish_error(request, err);
+        g_error_free(err);
+        return;
+    }
+
+    const gchar *uri = webkit_uri_scheme_request_get_uri(request);
+    const gchar *q = strchr(uri, '?');
+    if (q)
+        apply_config_query(self, q + 1);
+
+    gchar *html = config_html(self);
+    gsize len = strlen(html);
+    GBytes *bytes = g_bytes_new_take(html, len);
+    GInputStream *stream = g_memory_input_stream_new_from_bytes(bytes);
+    g_bytes_unref(bytes);
+    webkit_uri_scheme_request_finish(
+        request, stream, len, "text/html; charset=utf-8");
+    g_object_unref(stream);
+}
+
+static void register_hawk_scheme(HawkWin *self)
+{
+    WebKitWebContext *ctx = webkit_web_context_get_default();
+    webkit_web_context_register_uri_scheme(ctx, "hawk", on_hawk_scheme, self, NULL);
 }

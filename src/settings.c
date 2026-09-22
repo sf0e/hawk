@@ -1,12 +1,49 @@
 #include "hawk.h"
 
-static gchar *hawk_config_path(void)
+#include <stdio.h>
+
+gchar *hawk_data_dir(void)
+{
+    gchar *base = g_build_filename(g_get_home_dir(), HAWK_DATA_DIR, NULL);
+    g_mkdir_with_parents(base, 0700);
+    return base;
+}
+
+gchar *hawk_data_file(const gchar *name)
+{
+    gchar *base = hawk_data_dir();
+    gchar *path = g_build_filename(base, name, NULL);
+    g_free(base);
+    return path;
+}
+
+gchar *hawk_data_subdir(const gchar *sub)
+{
+    gchar *base = hawk_data_dir();
+    gchar *path = g_build_filename(base, sub, NULL);
+    g_mkdir_with_parents(path, 0700);
+    g_free(base);
+    return path;
+}
+
+static gchar *legacy_config_path(void)
 {
     const gchar *dir = g_get_user_config_dir();
     gchar *base = g_build_filename(dir, "hawk", NULL);
-    g_mkdir_with_parents(base, 0700);
     gchar *path = g_build_filename(base, "hawk.ini", NULL);
     g_free(base);
+    return path;
+}
+
+static gchar *hawk_config_path(void)
+{
+    gchar *path = hawk_data_file("hawk.ini");
+
+    gchar *legacy = legacy_config_path();
+    if (!g_file_test(path, G_FILE_TEST_EXISTS) &&
+        g_file_test(legacy, G_FILE_TEST_EXISTS))
+        rename(legacy, path);
+    g_free(legacy);
     return path;
 }
 
@@ -18,6 +55,8 @@ void hawk_config_init(SearchConfig *cfg)
     cfg->ua_lock = TRUE;
     cfg->block_media = TRUE;
     cfg->dark = FALSE;
+    cfg->restore_session = TRUE;
+    cfg->max_history = 400;
 }
 
 void hawk_config_load(SearchConfig *cfg)
@@ -43,6 +82,12 @@ void hawk_config_load(SearchConfig *cfg)
             g_key_file_get_boolean(kf, "privacy", "block_media", NULL);
         cfg->dark =
             g_key_file_get_boolean(kf, "ui", "dark", NULL);
+        cfg->restore_session =
+            g_key_file_get_boolean(kf, "session", "restore", NULL);
+        cfg->max_history =
+            g_key_file_get_integer(kf, "session", "max_history", NULL);
+        if (cfg->max_history < 10)
+            cfg->max_history = 400;
     } else {
         g_clear_error(&err);
     }
@@ -62,6 +107,8 @@ void hawk_config_save(const SearchConfig *cfg)
     g_key_file_set_boolean(kf, "privacy", "ua_lock", cfg->ua_lock);
     g_key_file_set_boolean(kf, "privacy", "block_media", cfg->block_media);
     g_key_file_set_boolean(kf, "ui", "dark", cfg->dark);
+    g_key_file_set_boolean(kf, "session", "restore", cfg->restore_session);
+    g_key_file_set_integer(kf, "session", "max_history", cfg->max_history);
 
     gchar *data = g_key_file_to_data(kf, NULL, NULL);
     GError *err = NULL;
