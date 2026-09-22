@@ -5,6 +5,10 @@
 A small browser for Linux. Written in C. It runs on GTK4 and WebKitGTK, and it
 looks a little bit like Safari. That's about as far as the ambitions go.
 
+**status: alpha.** it's a real, working browser — tabs, pills, dark mode,
+local search — out in the world so people can poke at it. rough edges are
+listed below so you can't say you weren't warned.
+
 Hawk doesn't call home. It doesn't have an account system. It doesn't have AI
 anything. It doesn't have a logo budget. What it has is a pill-shaped address
 bar and a private search engine that runs on your own machine, on demand,
@@ -56,12 +60,17 @@ ninja -C build
 ## install
 
 Linux only. There is no Windows build and no macOS build and there won't be.
-If you're on Arch you can install from the AUR once someone gets around to
-packaging it. Otherwise:
+The current cut is the alpha release
+[v0.1.0-alpha](https://github.com/sf0e/hawk/releases/tag/v0.1.0-alpha).
 
 ```sh
 curl -fsSL https://sf0e.github.io/hawk/get/install.sh | sh
 ```
+
+The installer builds from source and drops in a desktop entry plus the hawk
+icon, so it shows up in rofi and your app menu. A proper distributable binary
+and maybe a flatpak will arrive later, once we run out of other ways to
+procrastinate.
 
 ## layout
 

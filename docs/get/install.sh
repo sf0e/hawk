@@ -14,7 +14,7 @@
 set -e
 
 REPO="sf0e/hawk"
-TAG="v0.1.0"
+TAG="v0.1.0-alpha"
 BINDIR="$HOME/.local/bin"
 
 say()   { printf '\033[1;33mhawk\033[0m %s\n' "$*"; }
