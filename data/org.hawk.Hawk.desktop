@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hawk
+GenericName=Web Browser
+Comment=A small privacy-first browser for Linux
+Exec=hawk
+Icon=org.hawk.Hawk
+Terminal=false
+Categories=Network;WebBrowser;
+StartupNotify=true

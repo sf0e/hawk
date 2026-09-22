@@ -1,0 +1,177 @@
+#!/bin/sh
+# Hawk search backend manager — spawns/kills a private local SearXNG.
+#
+# On-demand lifecycle:
+#   - the browser calls `hawk-searchd start` at launch
+#   - SearXNG binds only to 127.0.0.1:<port>
+#   - the browser kills it (via pidfile) on exit
+#
+# Fallback: if SearXNG cannot start (e.g. network-less first setup),
+# the browser silently falls back to DuckDuckGo HTML. Hawk never fails
+# open to a tracking engine by default.
+#
+# Note: PyPI's `searxng` package is NOT the real metasearch engine; the
+# genuine SearXNG ships on GitHub. We vendor a source checkout and run it
+# directly (SEARXNG_SETTINGS_PATH points at our curated settings.yml).
+
+set -u
+
+BASE="${XDG_DATA_HOME:-$HOME/.local/share}/hawk"
+SRC="$BASE/src"
+VENV="$BASE/venv"
+PIDFILE="$BASE/searchd.pid"
+LOGFILE="$BASE/searchd.log"
+READY="$BASE/.ready"
+HOST="127.0.0.1"
+PORT="${HAWK_PORT:-8080}"
+URL="http://$HOST:$PORT"
+
+is_up() {
+    python3 - "$HOST" "$PORT" <<'PY'
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket()
+s.settimeout(0.3)
+try:
+    s.connect((host, port))
+    print("up")
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+
+write_settings() {
+    # SearXNG aborts on the default secret key; generate a stable one.
+    if [ ! -f "$BASE/secret_key" ]; then
+        python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null > "$BASE/secret_key" || \
+        openssl rand -hex 32 2>/dev/null > "$BASE/secret_key" || \
+        { tr -dc 'a-f0-9' < /dev/urandom | head -c 64 > "$BASE/secret_key"; }
+    fi
+    SECRET="$(tr -d '\n' < "$BASE/secret_key")"
+    cat > "$BASE/settings.yml" <<YAML
+use_default_settings: true
+
+server:
+  secret_key: "$SECRET"
+  bind_address: "$HOST"
+  port: $PORT
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  safe_search: 1
+
+ui:
+  default_locale: "en"
+  static_use_hash: true
+
+# Privacy-oriented engine set: drop raw Google/Bing (anti-bot captchas
+# and query profiling). The rest of the default engine list stays.
+engines:
+  - name: google
+    disabled: true
+  - name: bing
+    disabled: true
+  - name: google images
+    disabled: true
+  - name: bing images
+    disabled: true
+YAML
+}
+
+ensure_setup() {
+    mkdir -p "$BASE"
+
+    if [ ! -d "$SRC" ]; then
+        echo "Hawk: cloning SearXNG source (first run only)..." >&2
+        if ! git clone --depth 1 https://github.com/searxng/searxng.git "$SRC" 2>> "$LOGFILE"; then
+            echo "Hawk: could not fetch SearXNG; search falls back to DuckDuckGo" >&2
+            return 1
+        fi
+    fi
+
+    if [ ! -x "$VENV/bin/python" ]; then
+        echo "Hawk: creating venv (first run only)..." >&2
+        if ! python3 -m venv "$VENV"; then
+            echo "Hawk: venv creation failed; search falls back to DuckDuckGo" >&2
+            return 1
+        fi
+    fi
+
+    if [ ! -f "$READY" ]; then
+        echo "Hawk: installing SearXNG dependencies (first run only)..." >&2
+        if ! "$VENV/bin/pip" install --quiet --upgrade pip 2>> "$LOGFILE"; then
+            echo "Hawk: pip upgrade failed; see $LOGFILE" >&2
+            return 1
+        fi
+        if ! "$VENV/bin/pip" install --quiet --upgrade -r "$SRC/requirements.txt" 2>> "$LOGFILE"; then
+            echo "Hawk: SearXNG dependency install failed; see $LOGFILE" >&2
+            return 1
+        fi
+        touch "$READY"
+    fi
+
+    if [ ! -f "$BASE/settings.yml" ]; then
+        write_settings
+    fi
+    return 0
+}
+
+start() {
+    if is_up; then
+        echo "Hawk search backend already up: $URL"
+        exit 0
+    fi
+    if ! ensure_setup; then
+        exit 1
+    fi
+    : > "$LOGFILE"   # fresh log each launch
+    ( cd "$SRC" && \
+      SEARXNG_SETTINGS_PATH="$BASE/settings.yml" \
+      nohup "$VENV/bin/python" -m searx.webapp >> "$LOGFILE" 2>&1 < /dev/null &
+      echo $! > "$PIDFILE" )
+    i=0
+    while [ "$i" -lt 90 ]; do    # SearXNG cold-boots in ~25 s; give it 45 s
+        if is_up; then
+            echo "Hawk search backend up: $URL"
+            exit 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    echo "Hawk: backend did not become ready; see $LOGFILE" >&2
+    exit 1
+}
+
+stop() {
+    if [ -f "$PIDFILE" ]; then
+        PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+        if [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null; then
+            echo "Hawk search backend stopped"
+        else
+            echo "Hawk: no running backend (pid $PID)"
+        fi
+        rm -f "$PIDFILE"
+    else
+        echo "Hawk: no pidfile — nothing to stop"
+    fi
+}
+
+status() {
+    if is_up; then
+        echo "Hawk search backend: up ($URL)"
+    else
+        echo "Hawk search backend: down"
+    fi
+}
+
+case "${1:-}" in
+    start)  start ;;
+    stop)   stop ;;
+    status) status ;;
+    *)      echo "usage: $0 {start|stop|status}" >&2; exit 2 ;;
+esac
